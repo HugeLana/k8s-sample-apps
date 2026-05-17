@@ -52,6 +52,12 @@ variable "target_date" {
   description = "Target reservation date (YYYY-MM-DD). Voice calls begin once this date enters the rolling DAYS_AHEAD window."
 }
 
+variable "dedup_ttl_hours" {
+  type        = number
+  default     = 24
+  description = "How long a notified slot is suppressed before it can re-alert."
+}
+
 provider "aws" {
   region = var.region
 }
@@ -97,6 +103,36 @@ resource "aws_iam_role_policy" "sms_voice" {
   })
 }
 
+resource "aws_dynamodb_table" "dedup" {
+  name         = "french-laundry-notified-slots"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "slot_key"
+
+  attribute {
+    name = "slot_key"
+    type = "S"
+  }
+
+  ttl {
+    attribute_name = "expires_at"
+    enabled        = true
+  }
+}
+
+resource "aws_iam_role_policy" "ddb_dedup" {
+  name = "ddb-dedup"
+  role = aws_iam_role.lambda.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:PutItem"]
+      Resource = aws_dynamodb_table.dedup.arn
+    }]
+  })
+}
+
 resource "aws_cloudwatch_log_group" "lambda" {
   name              = "/aws/lambda/french-laundry-watcher"
   retention_in_days = 14
@@ -121,6 +157,8 @@ resource "aws_lambda_function" "watcher" {
       DESTINATION_NUMBER = var.destination_number
       VOICE_ID           = var.voice_id
       TARGET_DATE        = var.target_date
+      DEDUP_TABLE        = aws_dynamodb_table.dedup.name
+      DEDUP_TTL_HOURS    = tostring(var.dedup_ttl_hours)
     }
   }
 

@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import date, timedelta
 from typing import Any
 from urllib.parse import urlencode
@@ -34,6 +35,7 @@ logger.setLevel(logging.INFO)
 
 http = urllib3.PoolManager()
 sms_voice = boto3.client("pinpoint-sms-voice-v2")
+ddb = boto3.client("dynamodb")
 
 TOCK_BUSINESS = os.environ.get("TOCK_BUSINESS", "tfl")
 PARTY_SIZE = int(os.environ.get("PARTY_SIZE", "2"))
@@ -42,6 +44,8 @@ ORIGINATION_NUMBER = os.environ["ORIGINATION_NUMBER"]
 DESTINATION_NUMBER = os.environ["DESTINATION_NUMBER"]
 VOICE_ID = os.environ.get("VOICE_ID", "Joanna")
 TARGET_DATE = date.fromisoformat(os.environ["TARGET_DATE"])
+DEDUP_TABLE = os.environ["DEDUP_TABLE"]
+DEDUP_TTL_HOURS = int(os.environ.get("DEDUP_TTL_HOURS", "24"))
 
 # Tock's public search endpoint hit by the in-page widget. The exact path
 # and response shape change occasionally; if logs show 404/403 or zero
@@ -147,6 +151,39 @@ def voice_enabled(today: date) -> bool:
     return today >= TARGET_DATE - timedelta(days=DAYS_AHEAD)
 
 
+def slot_key(slot: dict[str, Any]) -> str:
+    return f"{slot['date']}|{slot['time']}|{slot.get('experience') or ''}"
+
+
+def filter_new_slots(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Atomically dedupe via DynamoDB conditional PutItem.
+
+    A slot survives if we have not put its key in the last
+    DEDUP_TTL_HOURS hours. After TTL expiry the key is removed and the
+    slot becomes notifiable again (covers cancellation re-appearance and
+    daily re-alerts for persistent slots).
+    """
+    now = int(time.time())
+    expires_at = now + DEDUP_TTL_HOURS * 3600
+    new_slots: list[dict[str, Any]] = []
+    for s in slots:
+        key = slot_key(s)
+        try:
+            ddb.put_item(
+                TableName=DEDUP_TABLE,
+                Item={
+                    "slot_key": {"S": key},
+                    "expires_at": {"N": str(expires_at)},
+                    "first_seen": {"N": str(now)},
+                },
+                ConditionExpression="attribute_not_exists(slot_key)",
+            )
+            new_slots.append(s)
+        except ddb.exceptions.ConditionalCheckFailedException:
+            continue
+    return new_slots
+
+
 def dates_for_mode(today: date, mode: str) -> list[date]:
     if mode == "edge":
         return [today + timedelta(days=DAYS_AHEAD)]
@@ -177,9 +214,19 @@ def handler(event, context):
         found.extend(slots)
 
     if not found:
-        return {"mode": mode, "available": 0}
+        return {"mode": mode, "available": 0, "new": 0}
 
-    summary = format_summary(found)
+    new_slots = filter_new_slots(found)
+    if not new_slots:
+        logger.info(json.dumps({
+            "event": "notify_skipped",
+            "mode": mode,
+            "slot_count": len(found),
+            "reason": "all_deduped",
+        }))
+        return {"mode": mode, "available": len(found), "new": 0}
+
+    summary = format_summary(new_slots)
     notify_sms(summary, mode)
     called = False
     if voice_enabled(today):
@@ -189,7 +236,13 @@ def handler(event, context):
         "event": "notify",
         "mode": mode,
         "slot_count": len(found),
+        "new_slot_count": len(new_slots),
         "sms": True,
         "voice": called,
     }))
-    return {"mode": mode, "available": len(found), "voice_called": called}
+    return {
+        "mode": mode,
+        "available": len(found),
+        "new": len(new_slots),
+        "voice_called": called,
+    }

@@ -112,6 +112,25 @@ Environment variables on the Lambda (set via Terraform variables):
 | `DESTINATION_NUMBER` | required | Your phone, E.164                             |
 | `VOICE_ID`           | `Joanna` | Polly voice for the call                      |
 | `TARGET_DATE`        | required | `YYYY-MM-DD`. Voice calls start once this date is bookable. |
+| `DEDUP_TABLE`        | required | DynamoDB table for slot dedup (provisioned by Terraform). |
+| `DEDUP_TTL_HOURS`    | `24`     | How long a notified slot is suppressed before it can re-alert. |
+
+## Notification dedup
+
+Each detected slot is keyed by `date|time|experience` and recorded in a
+DynamoDB table with a TTL. A slot only fires SMS/voice if it has not
+been put in the table within the last `DEDUP_TTL_HOURS` (default 24).
+This means:
+
+- A slot that persists across multiple hourly scans alerts **once per
+  24h**, not every hour.
+- A cancellation that reappears more than 24h after the last alert is
+  treated as a fresh event.
+- CloudWatch still logs every scan, so the fill pattern is fully
+  observable even when SMS is suppressed.
+
+To force a re-alert sooner, lower `dedup_ttl_hours` or delete rows from
+the `french-laundry-notified-slots` table.
 
 ## Observing the release pattern
 
