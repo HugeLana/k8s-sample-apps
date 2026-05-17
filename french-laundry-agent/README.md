@@ -1,68 +1,83 @@
 # French Laundry reservation watcher
 
-A Lambda that watches Tock for French Laundry availability and sends an
-SMS — and, once your target reservation date is bookable, places an
-outbound voice call — via AWS End User Messaging.
+Two Lambdas:
 
-It runs on two EventBridge schedules:
+- **Watcher** runs on schedule, queries Tock for availability, records
+  every scan in DynamoDB, and (once your target reservation date is
+  bookable) sends an SMS and a voice call via AWS End User Messaging.
+- **Dashboard** is invoked via a Lambda Function URL and renders an HTML
+  page with a Chart.js plot of the fill curve plus a recent-scans table.
+
+Watcher schedules:
 
 - **Hourly (edge mode)** — `cron(1 * * * ? *)` America/Los_Angeles.
-  Checks only `today + DAYS_AHEAD`, the date newly entering the rolling
-  window at midnight PT. Lets you observe the release fill-curve in
-  CloudWatch.
+  Checks only `today + DAYS_AHEAD`, the date entering the rolling
+  window at midnight PT. The hourly cadence captures the fill curve of
+  the fresh release.
 - **Daily (rolling mode)** — `cron(30 8 * * ? *)` America/Los_Angeles.
   Sweeps `today+1 .. today+DAYS_AHEAD-1` once a day to catch
   cancellation drops.
 
 ## Notification policy
 
-| Phase                                            | SMS | Voice call |
-| ------------------------------------------------ | --- | ---------- |
-| Before `TARGET_DATE` enters the rolling window   | yes | no         |
-| Once `TARGET_DATE` is within `DAYS_AHEAD` days   | yes | yes        |
+Behavior depends on whether `TARGET_DATE` is yet inside the rolling
+`DAYS_AHEAD` window:
 
-Voice calls activate on the day `today >= TARGET_DATE - DAYS_AHEAD`.
-With `DAYS_AHEAD=60` and `TARGET_DATE=2026-10-01`, calls begin on
-**2026-08-02**. Before that you'll get SMS notifications only — handy
-for learning the release pattern without a 12:01 AM phone call.
+| Phase                                                                  | Dashboard | SMS | Voice |
+| ---------------------------------------------------------------------- | --------- | --- | ----- |
+| **Phase 1** — `today <  TARGET_DATE - DAYS_AHEAD` (silent collection)  | yes       | no  | no    |
+| **Phase 2** — `today >= TARGET_DATE - DAYS_AHEAD` (target now bookable) | yes       | yes | yes   |
 
-> **Important caveats**
+With `DAYS_AHEAD=60` and `TARGET_DATE=2026-10-01`, alerts switch on
+**2026-08-02**. Until then the dashboard is the only signal — quiet
+data collection so you can study the release pattern. Once Phase 2
+starts, every hourly scan that finds availability fires both SMS and
+a voice call.
+
+> **Caveats**
 >
-> - Tock's terms prohibit automated booking. This tool only **notifies**;
+> - Tock's terms prohibit automated booking. This tool only notifies;
 >   you complete the reservation yourself.
 > - Tock has no public API. The handler hits the same endpoint the
->   in-page widget uses, with browser-like headers. If Tock changes the
->   endpoint or response shape, update `TOCK_SEARCH_URL` / `extract_slots`
->   in `lambda/handler.py`. CloudWatch logs the raw response on parse
+>   in-page widget uses, with browser-like headers. If Tock changes
+>   the shape, update `TOCK_SEARCH_URL` / `extract_slots` in
+>   `lambda/handler.py`. CloudWatch logs the raw response on parse
 >   failures.
-> - Tock fronts requests with Cloudflare. AWS Lambda egress IPs may be
->   challenged. If you see persistent 403s, route the Lambda through a
->   NAT'd VPC with a stable IP and/or add a residential proxy.
+> - Tock fronts requests with Cloudflare. AWS Lambda egress IPs may
+>   be challenged. If you see persistent 403s, route the Lambda
+>   through a NAT'd VPC with a stable IP and/or add a residential
+>   proxy.
 
 ## Architecture
 
 ```
 EventBridge Scheduler
-  ├─ hourly  (cron 1 * * * ? *,  America/Los_Angeles) ─┐  input={"mode":"edge"}
-  └─ daily   (cron 30 8 * * ? *, America/Los_Angeles) ─┤  input={"mode":"rolling"}
-                                                       ▼
-                                              Lambda (handler.py)
-                                                       │
-                                                       ▼
-                                              Tock search endpoint
-                                                       │
-                       ┌───────────────────────────────┴─────────────────────────────┐
-                       ▼                                                             ▼
-       AWS End User Messaging Voice                                AWS End User Messaging SMS
-       (SendVoiceMessage, gated by TARGET_DATE)                    (SendTextMessage, always)
+  ├─ hourly  (cron 1 * * * ? *,  America/Los_Angeles)  input={"mode":"edge"}
+  └─ daily   (cron 30 8 * * ? *, America/Los_Angeles)  input={"mode":"rolling"}
+                                │
+                                ▼
+                    Watcher Lambda (handler.py)  ──►  Tock search endpoint
+                                │
+                                ├─►  DynamoDB scans table  (every scan)
+                                │
+                                └─►  (Phase 2 only) AWS End User Messaging
+                                        ├─ SendVoiceMessage
+                                        └─ SendTextMessage
+
+                    Dashboard Lambda (dashboard.py)
+                                ▲
+                                │ Function URL (HTML)
+                                │
+                          Your browser
 ```
 
 ## Layout
 
 ```
 french-laundry-agent/
-├── lambda/handler.py     # Lambda code
-└── infra/main.tf         # Terraform: Lambda + Scheduler + IAM + logs
+├── lambda/handler.py        # watcher
+├── dashboard/dashboard.py   # dashboard
+└── infra/main.tf            # Terraform for both Lambdas + schedules + DDB
 ```
 
 ## Deploy
@@ -70,10 +85,10 @@ french-laundry-agent/
 Prerequisites:
 
 - Terraform ≥ 1.5, AWS credentials with permissions for Lambda, IAM,
-  CloudWatch Logs, EventBridge Scheduler.
+  CloudWatch Logs, EventBridge Scheduler, DynamoDB.
 - An AWS End User Messaging origination number in your account.
-- Your destination phone verified in End User Messaging (or the account
-  graduated out of sandbox).
+- Your destination phone verified in End User Messaging (or the
+  account graduated out of sandbox).
 
 ```bash
 cd french-laundry-agent/infra
@@ -84,10 +99,15 @@ terraform apply \
   -var 'destination_number=+15557654321' \
   -var 'target_date=2026-10-01' \
   -var 'party_size=2' \
-  -var 'days_ahead=60'
+  -var 'days_ahead=60' \
+  -var "dashboard_key=$(openssl rand -hex 16)"
 ```
 
-To test the Lambda once without waiting for the next schedule:
+The Function URL is printed as `dashboard_url`. Visit it with
+`?key=<value>` appended (or set `dashboard_key=""` to make it
+unauthenticated).
+
+To trigger a scan immediately:
 
 ```bash
 # Edge mode (newly-opening date only)
@@ -101,51 +121,44 @@ aws lambda invoke --function-name french-laundry-watcher \
 
 ## Tuning
 
-Environment variables on the Lambda (set via Terraform variables):
+Watcher environment variables (set via Terraform vars of the same name):
 
-| Variable             | Default  | Purpose                                       |
-| -------------------- | -------- | --------------------------------------------- |
-| `TOCK_BUSINESS`      | `tfl`    | Tock business slug (`tfl` = The French Laundry) |
-| `PARTY_SIZE`         | `2`      | Party size to search                          |
-| `DAYS_AHEAD`         | `60`     | Days to scan from today                       |
-| `ORIGINATION_NUMBER` | required | AWS-provisioned phone number, E.164           |
-| `DESTINATION_NUMBER` | required | Your phone, E.164                             |
-| `VOICE_ID`           | `Joanna` | Polly voice for the call                      |
-| `TARGET_DATE`        | required | `YYYY-MM-DD`. Voice calls start once this date is bookable. |
-| `DEDUP_TABLE`        | required | DynamoDB table for slot dedup (provisioned by Terraform). |
-| `DEDUP_TTL_HOURS`    | `24`     | How long a notified slot is suppressed before it can re-alert. |
+| Variable              | Default  | Purpose                                       |
+| --------------------- | -------- | --------------------------------------------- |
+| `TOCK_BUSINESS`       | `tfl`    | Tock business slug                            |
+| `PARTY_SIZE`          | `2`      | Party size to search                          |
+| `DAYS_AHEAD`          | `60`     | Days to scan from today                       |
+| `ORIGINATION_NUMBER`  | required | AWS-provisioned phone number, E.164           |
+| `DESTINATION_NUMBER`  | required | Your phone, E.164                             |
+| `VOICE_ID`            | `Joanna` | Polly voice for the call                      |
+| `TARGET_DATE`         | required | `YYYY-MM-DD`. Alerts activate once this date is in the window. |
+| `SCANS_TABLE`         | required | DynamoDB table for scan history (Terraform sets this). |
+| `SCAN_RETENTION_DAYS` | `90`     | DDB TTL for scan rows.                        |
 
-## Notification dedup
+Dashboard variables:
 
-Each detected slot is keyed by `date|time|experience` and recorded in a
-DynamoDB table with a TTL. A slot only fires SMS/voice if it has not
-been put in the table within the last `DEDUP_TTL_HOURS` (default 24).
-This means:
+| Variable        | Default  | Purpose                                       |
+| --------------- | -------- | --------------------------------------------- |
+| `DASHBOARD_KEY` | `""`     | If set, the URL requires `?key=<value>`.      |
 
-- A slot that persists across multiple hourly scans alerts **once per
-  24h**, not every hour.
-- A cancellation that reappears more than 24h after the last alert is
-  treated as a fresh event.
-- CloudWatch still logs every scan, so the fill pattern is fully
-  observable even when SMS is suppressed.
+## Dashboard
 
-To force a re-alert sooner, lower `dedup_ttl_hours` or delete rows from
-the `french-laundry-notified-slots` table.
+Open the `dashboard_url` (with `?key=...` if you set one). You'll see:
 
-## Observing the release pattern
+- A banner showing **Phase 1** (silent) or **Phase 2** (alerting),
+  with the countdown to alert activation.
+- A line chart of slot counts over time for the edge date (today+60)
+  and the daily rolling sum.
+- A table of the most recent 80 scans.
+- Window picker: 1d / 7d / 14d / 30d.
 
-Every scan writes a structured JSON log line:
+The scans table itself is queryable directly if you want raw data:
 
-```json
-{"event":"scan","mode":"edge","date":"2026-08-02","slot_count":7,"target_date":"2026-10-01"}
-```
-
-CloudWatch Logs Insights query to plot fill-rate of the edge date:
-
-```
-fields @timestamp, date, slot_count
-| filter event = "scan" and mode = "edge"
-| sort @timestamp asc
+```bash
+aws dynamodb query \
+  --table-name french-laundry-scans \
+  --key-condition-expression "pk = :p" \
+  --expression-attribute-values '{":p":{"S":"scan"}}'
 ```
 
 ## Verifying the Tock endpoint

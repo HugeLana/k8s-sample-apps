@@ -52,10 +52,17 @@ variable "target_date" {
   description = "Target reservation date (YYYY-MM-DD). Voice calls begin once this date enters the rolling DAYS_AHEAD window."
 }
 
-variable "dedup_ttl_hours" {
+variable "scan_retention_days" {
   type        = number
-  default     = 24
-  description = "How long a notified slot is suppressed before it can re-alert."
+  default     = 90
+  description = "How long each scan row is kept in the scans table (DDB TTL)."
+}
+
+variable "dashboard_key" {
+  type        = string
+  default     = ""
+  sensitive   = true
+  description = "Bearer key required on the dashboard URL as ?key=<value>. Leave empty to make the dashboard public (security through obscurity of the Function URL)."
 }
 
 provider "aws" {
@@ -103,13 +110,19 @@ resource "aws_iam_role_policy" "sms_voice" {
   })
 }
 
-resource "aws_dynamodb_table" "dedup" {
-  name         = "french-laundry-notified-slots"
+resource "aws_dynamodb_table" "scans" {
+  name         = "french-laundry-scans"
   billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "slot_key"
+  hash_key     = "pk"
+  range_key    = "sk"
 
   attribute {
-    name = "slot_key"
+    name = "pk"
+    type = "S"
+  }
+
+  attribute {
+    name = "sk"
     type = "S"
   }
 
@@ -119,8 +132,8 @@ resource "aws_dynamodb_table" "dedup" {
   }
 }
 
-resource "aws_iam_role_policy" "ddb_dedup" {
-  name = "ddb-dedup"
+resource "aws_iam_role_policy" "scans_write" {
+  name = "scans-write"
   role = aws_iam_role.lambda.id
 
   policy = jsonencode({
@@ -128,7 +141,7 @@ resource "aws_iam_role_policy" "ddb_dedup" {
     Statement = [{
       Effect   = "Allow"
       Action   = ["dynamodb:PutItem"]
-      Resource = aws_dynamodb_table.dedup.arn
+      Resource = aws_dynamodb_table.scans.arn
     }]
   })
 }
@@ -157,8 +170,8 @@ resource "aws_lambda_function" "watcher" {
       DESTINATION_NUMBER = var.destination_number
       VOICE_ID           = var.voice_id
       TARGET_DATE        = var.target_date
-      DEDUP_TABLE        = aws_dynamodb_table.dedup.name
-      DEDUP_TTL_HOURS    = tostring(var.dedup_ttl_hours)
+      SCANS_TABLE        = aws_dynamodb_table.scans.name
+      SCAN_RETENTION_DAYS = tostring(var.scan_retention_days)
     }
   }
 
@@ -226,6 +239,76 @@ resource "aws_scheduler_schedule" "daily_rolling" {
   }
 }
 
+data "archive_file" "dashboard_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/../dashboard"
+  output_path = "${path.module}/build/dashboard.zip"
+}
+
+resource "aws_iam_role" "dashboard" {
+  name = "french-laundry-dashboard"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { Service = "lambda.amazonaws.com" }
+      Action    = "sts:AssumeRole"
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "dashboard_basic" {
+  role       = aws_iam_role.dashboard.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+}
+
+resource "aws_iam_role_policy" "scans_read" {
+  name = "scans-read"
+  role = aws_iam_role.dashboard.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect   = "Allow"
+      Action   = ["dynamodb:Query"]
+      Resource = aws_dynamodb_table.scans.arn
+    }]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "dashboard" {
+  name              = "/aws/lambda/french-laundry-dashboard"
+  retention_in_days = 14
+}
+
+resource "aws_lambda_function" "dashboard" {
+  function_name    = "french-laundry-dashboard"
+  role             = aws_iam_role.dashboard.arn
+  filename         = data.archive_file.dashboard_zip.output_path
+  source_code_hash = data.archive_file.dashboard_zip.output_base64sha256
+  handler          = "dashboard.handler"
+  runtime          = "python3.12"
+  timeout          = 30
+  memory_size      = 256
+
+  environment {
+    variables = {
+      SCANS_TABLE   = aws_dynamodb_table.scans.name
+      TARGET_DATE   = var.target_date
+      DAYS_AHEAD    = tostring(var.days_ahead)
+      DASHBOARD_KEY = var.dashboard_key
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.dashboard]
+}
+
+resource "aws_lambda_function_url" "dashboard" {
+  function_name      = aws_lambda_function.dashboard.function_name
+  authorization_type = "NONE"
+}
+
 output "lambda_name" {
   value = aws_lambda_function.watcher.function_name
 }
@@ -236,4 +319,8 @@ output "hourly_schedule" {
 
 output "daily_schedule" {
   value = aws_scheduler_schedule.daily_rolling.name
+}
+
+output "dashboard_url" {
+  value = aws_lambda_function_url.dashboard.function_url
 }

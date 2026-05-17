@@ -4,17 +4,19 @@ Two run modes, selected by the EventBridge event payload:
 
   mode=edge     Check only `today + DAYS_AHEAD` (the date newly entering
                 the rolling window). Wired to an hourly schedule so the
-                fill-curve of a fresh release is visible in CloudWatch.
+                fill-curve of a fresh release is visible on the dashboard.
 
   mode=rolling  Check `today+1 .. today+DAYS_AHEAD-1` (already-open
                 dates) once a day to pick up cancellation drops.
 
+Every scan writes one row per checked date into the scans table; the
+dashboard Lambda queries that for the UI.
+
 Notification policy:
-  - SMS fires on every scan that finds availability.
-  - Voice call fires only once `TARGET_DATE` has entered the rolling
-    window (i.e. `today >= TARGET_DATE - DAYS_AHEAD`). Until then SMS
-    only — useful for observing release behavior without being woken at
-    midnight.
+  - Phase 1 (today <  TARGET_DATE - DAYS_AHEAD): silent. Scan + record
+    only; no SMS, no calls. The dashboard is the only channel.
+  - Phase 2 (today >= TARGET_DATE - DAYS_AHEAD): every scan that finds
+    availability fires an SMS and a voice call.
 """
 
 from __future__ import annotations
@@ -44,8 +46,8 @@ ORIGINATION_NUMBER = os.environ["ORIGINATION_NUMBER"]
 DESTINATION_NUMBER = os.environ["DESTINATION_NUMBER"]
 VOICE_ID = os.environ.get("VOICE_ID", "Joanna")
 TARGET_DATE = date.fromisoformat(os.environ["TARGET_DATE"])
-DEDUP_TABLE = os.environ["DEDUP_TABLE"]
-DEDUP_TTL_HOURS = int(os.environ.get("DEDUP_TTL_HOURS", "24"))
+SCANS_TABLE = os.environ["SCANS_TABLE"]
+SCAN_RETENTION_DAYS = int(os.environ.get("SCAN_RETENTION_DAYS", "90"))
 
 # Tock's public search endpoint hit by the in-page widget. The exact path
 # and response shape change occasionally; if logs show 404/403 or zero
@@ -147,41 +149,29 @@ def notify_sms(summary: str, mode: str) -> None:
     )
 
 
-def voice_enabled(today: date) -> bool:
+def alerts_active(today: date) -> bool:
+    """Phase 2 — SMS + voice fire on every detection."""
     return today >= TARGET_DATE - timedelta(days=DAYS_AHEAD)
 
 
-def slot_key(slot: dict[str, Any]) -> str:
-    return f"{slot['date']}|{slot['time']}|{slot.get('experience') or ''}"
-
-
-def filter_new_slots(slots: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Atomically dedupe via DynamoDB conditional PutItem.
-
-    A slot survives if we have not put its key in the last
-    DEDUP_TTL_HOURS hours. After TTL expiry the key is removed and the
-    slot becomes notifiable again (covers cancellation re-appearance and
-    daily re-alerts for persistent slots).
-    """
+def record_scan(mode: str, target_date: date, slots: list[dict[str, Any]]) -> None:
     now = int(time.time())
-    expires_at = now + DEDUP_TTL_HOURS * 3600
-    new_slots: list[dict[str, Any]] = []
-    for s in slots:
-        key = slot_key(s)
-        try:
-            ddb.put_item(
-                TableName=DEDUP_TABLE,
-                Item={
-                    "slot_key": {"S": key},
-                    "expires_at": {"N": str(expires_at)},
-                    "first_seen": {"N": str(now)},
-                },
-                ConditionExpression="attribute_not_exists(slot_key)",
-            )
-            new_slots.append(s)
-        except ddb.exceptions.ConditionalCheckFailedException:
-            continue
-    return new_slots
+    sk = f"{now:010d}#{target_date.isoformat()}"
+    ddb.put_item(
+        TableName=SCANS_TABLE,
+        Item={
+            "pk": {"S": "scan"},
+            "sk": {"S": sk},
+            "mode": {"S": mode},
+            "date_checked": {"S": target_date.isoformat()},
+            "timestamp": {"N": str(now)},
+            "slot_count": {"N": str(len(slots))},
+            "slots": {"S": json.dumps(
+                [{"time": s.get("time"), "experience": s.get("experience")} for s in slots]
+            )},
+            "expires_at": {"N": str(now + SCAN_RETENTION_DAYS * 86400)},
+        },
+    )
 
 
 def dates_for_mode(today: date, mode: str) -> list[date]:
@@ -196,6 +186,7 @@ def handler(event, context):
     mode = (event or {}).get("mode", "rolling")
     today = date.today()
     dates = dates_for_mode(today, mode)
+    phase2 = alerts_active(today)
 
     found: list[dict[str, Any]] = []
     for d in dates:
@@ -204,45 +195,33 @@ def handler(event, context):
         except Exception:
             logger.exception("Tock query failed for %s", d)
             continue
+        record_scan(mode, d, slots)
         logger.info(json.dumps({
             "event": "scan",
             "mode": mode,
             "date": d.isoformat(),
             "slot_count": len(slots),
             "target_date": TARGET_DATE.isoformat(),
+            "phase": "2" if phase2 else "1",
         }))
         found.extend(slots)
 
-    if not found:
-        return {"mode": mode, "available": 0, "new": 0}
-
-    new_slots = filter_new_slots(found)
-    if not new_slots:
-        logger.info(json.dumps({
-            "event": "notify_skipped",
+    if not found or not phase2:
+        return {
             "mode": mode,
-            "slot_count": len(found),
-            "reason": "all_deduped",
-        }))
-        return {"mode": mode, "available": len(found), "new": 0}
+            "phase": "2" if phase2 else "1",
+            "available": len(found),
+            "notified": False,
+        }
 
-    summary = format_summary(new_slots)
+    summary = format_summary(found)
     notify_sms(summary, mode)
-    called = False
-    if voice_enabled(today):
-        notify_voice(summary)
-        called = True
+    notify_voice(summary)
     logger.info(json.dumps({
         "event": "notify",
         "mode": mode,
         "slot_count": len(found),
-        "new_slot_count": len(new_slots),
         "sms": True,
-        "voice": called,
+        "voice": True,
     }))
-    return {
-        "mode": mode,
-        "available": len(found),
-        "new": len(new_slots),
-        "voice_called": called,
-    }
+    return {"mode": mode, "phase": "2", "available": len(found), "notified": True}
