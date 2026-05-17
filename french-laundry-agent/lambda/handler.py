@@ -1,8 +1,20 @@
 """French Laundry reservation watcher.
 
-Runs on a schedule (EventBridge), queries Tock for availability across a
-rolling window, and — if any slot is found — places an outbound voice
-call and sends an SMS via AWS End User Messaging (pinpoint-sms-voice-v2).
+Two run modes, selected by the EventBridge event payload:
+
+  mode=edge     Check only `today + DAYS_AHEAD` (the date newly entering
+                the rolling window). Wired to an hourly schedule so the
+                fill-curve of a fresh release is visible in CloudWatch.
+
+  mode=rolling  Check `today+1 .. today+DAYS_AHEAD-1` (already-open
+                dates) once a day to pick up cancellation drops.
+
+Notification policy:
+  - SMS fires on every scan that finds availability.
+  - Voice call fires only once `TARGET_DATE` has entered the rolling
+    window (i.e. `today >= TARGET_DATE - DAYS_AHEAD`). Until then SMS
+    only — useful for observing release behavior without being woken at
+    midnight.
 """
 
 from __future__ import annotations
@@ -29,6 +41,7 @@ DAYS_AHEAD = int(os.environ.get("DAYS_AHEAD", "60"))
 ORIGINATION_NUMBER = os.environ["ORIGINATION_NUMBER"]
 DESTINATION_NUMBER = os.environ["DESTINATION_NUMBER"]
 VOICE_ID = os.environ.get("VOICE_ID", "Joanna")
+TARGET_DATE = date.fromisoformat(os.environ["TARGET_DATE"])
 
 # Tock's public search endpoint hit by the in-page widget. The exact path
 # and response shape change occasionally; if logs show 404/403 or zero
@@ -119,9 +132,9 @@ def notify_voice(summary: str) -> None:
     )
 
 
-def notify_sms(summary: str) -> None:
+def notify_sms(summary: str, mode: str) -> None:
     link = f"https://www.exploretock.com/{TOCK_BUSINESS}"
-    body = f"French Laundry availability:\n{summary}\nBook: {link}"
+    body = f"[FL/{mode}] {summary}\n{link}"
     sms_voice.send_text_message(
         DestinationPhoneNumber=DESTINATION_NUMBER,
         OriginationIdentity=ORIGINATION_NUMBER,
@@ -130,21 +143,53 @@ def notify_sms(summary: str) -> None:
     )
 
 
-def handler(event, context):
-    today = date.today()
-    found: list[dict[str, Any]] = []
-    for offset in range(DAYS_AHEAD + 1):
-        target = today + timedelta(days=offset)
-        try:
-            found.extend(search_tock(target))
-        except Exception:
-            logger.exception("Tock query failed for %s", target)
+def voice_enabled(today: date) -> bool:
+    return today >= TARGET_DATE - timedelta(days=DAYS_AHEAD)
 
-    logger.info("Total available slots found: %d", len(found))
+
+def dates_for_mode(today: date, mode: str) -> list[date]:
+    if mode == "edge":
+        return [today + timedelta(days=DAYS_AHEAD)]
+    if mode == "rolling":
+        return [today + timedelta(days=d) for d in range(1, DAYS_AHEAD)]
+    raise ValueError(f"unknown mode: {mode}")
+
+
+def handler(event, context):
+    mode = (event or {}).get("mode", "rolling")
+    today = date.today()
+    dates = dates_for_mode(today, mode)
+
+    found: list[dict[str, Any]] = []
+    for d in dates:
+        try:
+            slots = search_tock(d)
+        except Exception:
+            logger.exception("Tock query failed for %s", d)
+            continue
+        logger.info(json.dumps({
+            "event": "scan",
+            "mode": mode,
+            "date": d.isoformat(),
+            "slot_count": len(slots),
+            "target_date": TARGET_DATE.isoformat(),
+        }))
+        found.extend(slots)
+
     if not found:
-        return {"available": 0}
+        return {"mode": mode, "available": 0}
 
     summary = format_summary(found)
-    notify_voice(summary)
-    notify_sms(summary)
-    return {"available": len(found), "slots": found[:20]}
+    notify_sms(summary, mode)
+    called = False
+    if voice_enabled(today):
+        notify_voice(summary)
+        called = True
+    logger.info(json.dumps({
+        "event": "notify",
+        "mode": mode,
+        "slot_count": len(found),
+        "sms": True,
+        "voice": called,
+    }))
+    return {"mode": mode, "available": len(found), "voice_called": called}

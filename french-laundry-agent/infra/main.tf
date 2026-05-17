@@ -47,6 +47,11 @@ variable "voice_id" {
   default = "Joanna"
 }
 
+variable "target_date" {
+  type        = string
+  description = "Target reservation date (YYYY-MM-DD). Voice calls begin once this date enters the rolling DAYS_AHEAD window."
+}
+
 provider "aws" {
   region = var.region
 }
@@ -115,6 +120,7 @@ resource "aws_lambda_function" "watcher" {
       ORIGINATION_NUMBER = var.origination_number
       DESTINATION_NUMBER = var.destination_number
       VOICE_ID           = var.voice_id
+      TARGET_DATE        = var.target_date
     }
   }
 
@@ -148,19 +154,37 @@ resource "aws_iam_role_policy" "scheduler_invoke" {
   })
 }
 
-resource "aws_scheduler_schedule" "midnight_pt" {
-  name = "french-laundry-midnight-pt"
+resource "aws_scheduler_schedule" "hourly_edge" {
+  name = "french-laundry-hourly-edge"
 
   flexible_time_window {
     mode = "OFF"
   }
 
-  schedule_expression          = "cron(0 0 * * ? *)"
+  schedule_expression          = "cron(1 * * * ? *)"
   schedule_expression_timezone = "America/Los_Angeles"
 
   target {
     arn      = aws_lambda_function.watcher.arn
     role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ mode = "edge" })
+  }
+}
+
+resource "aws_scheduler_schedule" "daily_rolling" {
+  name = "french-laundry-daily-rolling"
+
+  flexible_time_window {
+    mode = "OFF"
+  }
+
+  schedule_expression          = "cron(30 8 * * ? *)"
+  schedule_expression_timezone = "America/Los_Angeles"
+
+  target {
+    arn      = aws_lambda_function.watcher.arn
+    role_arn = aws_iam_role.scheduler.arn
+    input    = jsonencode({ mode = "rolling" })
   }
 }
 
@@ -168,6 +192,10 @@ output "lambda_name" {
   value = aws_lambda_function.watcher.function_name
 }
 
-output "schedule_name" {
-  value = aws_scheduler_schedule.midnight_pt.name
+output "hourly_schedule" {
+  value = aws_scheduler_schedule.hourly_edge.name
+}
+
+output "daily_schedule" {
+  value = aws_scheduler_schedule.daily_rolling.name
 }
